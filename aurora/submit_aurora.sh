@@ -27,7 +27,7 @@ CONFIG="${CONFIG:-dp}"
 # directory from the submission directory.
 EXAMPLE_DIR="${PBS_O_WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 if [[ ! -f "$EXAMPLE_DIR/env.sh" ]]; then
-    echo "error: submit from the vit-training directory ($EXAMPLE_DIR has no env.sh)" >&2
+    echo "error: submit from the aurora directory ($EXAMPLE_DIR has no env.sh)" >&2
     exit 1
 fi
 source "$EXAMPLE_DIR/env.sh"

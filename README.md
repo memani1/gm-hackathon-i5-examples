@@ -37,7 +37,9 @@ DataLoader workers alive between epochs, and one ports the model-parallel
 
 ## Sources and credits
 
-The folders are copied unchanged from the `vit-training/` folders of the per-system AmSC example repositories:
+The folders are copied from the `vit-training/` folders of the per-system AmSC example repositories.
+The only edits are two path references in `aurora/` (a comment in `ViT_aurora.yaml` and an
+error message in `submit_aurora.sh`), updated for this repo's layout.
 
 | Folder | Source | Commit | Authors |
 |---|---|---|---|

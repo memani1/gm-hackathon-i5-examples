@@ -1,6 +1,6 @@
 # ViT-on-ERA5 training configs for Aurora (12 XPU tiles per node).
 #
-# Counterparts of the Perlmutter `dp` config (../../perlmutter/vit-training):
+# Counterparts of the Perlmutter `dp` config (../perlmutter):
 # same model, full 37,960-sample training set, 16 samples per tile, fp16, fused
 # Adam, torch.compile, 8 loader workers, 4 epochs. Two differences: the PyTorch
 # data loader (DALI is NVIDIA-only), and a global batch of 192 per node instead
