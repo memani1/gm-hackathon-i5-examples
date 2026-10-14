@@ -17,18 +17,13 @@ Perlmutter `dp` example.
 
 ## Quick start
 
-For the Genesis hackathon, there is reservation in place. Please use
-GenesisHackathonOct26 for the project and R8914313 for the queue in your submission scripts.
+For the Genesis hackathon, there is a reservation in place. Use project
+`GenesisHackathonOct26` and queue `R8914313` in your `qsub` commands.
 
 ```bash
 ./setup.sh
-qsub -A <project> -l select=1 -q debug -v CONFIG=smoke submit_aurora.sh   # ~2 min check
-qsub -A <project> submit_aurora.sh                                       # dp, 4 nodes, ~10 min
-
-## For the hackathon
-./setup.sh
-qsub -A GenesisHackathonOct26 -l select=1 -q R8914313 -v CONFIG=smoke submit_aurora.sh   # ~2 min check
-qsub -A GenesisHackathonOct26 submit_aurora.sh                                       # dp, 4 nodes, ~10 min
+qsub -A GenesisHackathonOct26 -q R8914313 -l select=1 -v CONFIG=smoke submit_aurora.sh   # ~2 min check
+qsub -A GenesisHackathonOct26 -q R8914313 -l select=4 submit_aurora.sh                   # dp, 4 nodes, ~10 min
 ```
 
 Submit from this directory. PBS output goes to `vit-weather.o<jobid>` here.
