@@ -1,6 +1,9 @@
-# Genesis hackathon: ViT training examples
+# Genesis hackathon I5: ViT training examples
 
-Examples for training a Vision Transformer (ViT) on ERA5 weather data on three DOE
+Examples for the Genesis hackathon session **I5. Getting started with pretraining
+foundation models on DOE supercomputers**.
+
+They train a Vision Transformer (ViT) on ERA5 weather data on three DOE
 supercomputers, using the code from the
 [SC25 deep learning at scale tutorial](https://github.com/NERSC/sc25-dl-tutorial).
 
