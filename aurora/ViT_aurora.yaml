@@ -1,0 +1,131 @@
+# ViT-on-ERA5 training configs for Aurora (12 XPU tiles per node).
+#
+# Counterparts of the Perlmutter `dp` config (../../perlmutter/vit-training):
+# same model, full 37,960-sample training set, 16 samples per tile, fp16, fused
+# Adam, torch.compile, 8 loader workers, 4 epochs. Two differences: the PyTorch
+# data loader (DALI is NVIDIA-only), and a global batch of 192 per node instead
+# of a fixed 256, with lr = 2e-3 * sqrt(global_batch_size / 256).
+#
+# Each config is sized for one node count; global_batch_size = 16 * 12 * nodes.
+# Training runs whole epochs only: num_iters is rounded down to a multiple of
+# the epoch length. $DATADIR and $LOGDIR are filled in by run_aurora.sh.
+
+common: &common
+  # Model
+  embed_dim: 384
+  depth: 12
+  num_heads: 8
+  patch_size: 8
+  dropout: 0.0
+  model_backend: pytorch
+
+  # Data
+  img_size: [360, 720]
+  dt: 1
+  n_in_channels: 20
+  n_out_channels: 20
+  train_data_path: $DATADIR/train
+  valid_data_path: $DATADIR/valid
+  global_means_path: $DATADIR/stats/global_means.npy
+  global_stds_path: $DATADIR/stats/global_stds.npy
+  limit_nsamples: None
+  limit_nsamples_val: None
+  data_loader_config: pytorch
+  num_data_workers: 8
+
+  # Training
+  expdir: $LOGDIR
+  lr_schedule: cosine
+  warmup: 0
+  optimizer: Adam
+  amp_mode: fp16
+  enable_fused: true
+  enable_jit: true
+
+# Quick check, 1 node: 2 epochs of 10 steps on a subset, no compile (~2 min job)
+smoke:
+  <<: *common
+  global_batch_size: 192
+  lr: 1.73e-3
+  num_iters: 20
+  limit_nsamples: 1920
+  limit_nsamples_val: 192
+  enable_jit: false
+
+dp_1node:                     # 197 steps/epoch
+  <<: *common
+  global_batch_size: 192
+  lr: 1.73e-3
+  num_iters: 788
+
+dp_2node:                     # 98 steps/epoch
+  <<: *common
+  global_batch_size: 384
+  lr: 2.45e-3
+  num_iters: 392
+
+dp:                           # 4 nodes, 49 steps/epoch
+  <<: *common
+  global_batch_size: 768
+  lr: 3.46e-3
+  num_iters: 196
+
+dp_8node:                     # 24 steps/epoch; 8 epochs for a steadier average
+  <<: *common
+  global_batch_size: 1536
+  lr: 4.90e-3
+  num_iters: 192
+
+dp_16node:                    # 12 steps/epoch; 8 epochs for a steadier average
+  <<: *common
+  global_batch_size: 3072
+  lr: 6.93e-3
+  num_iters: 96
+
+# ------------------------------------------------------------------------------
+# Model-parallel configs (train_mp.py). Counterparts of the Perlmutter `mp`
+# config: the larger model (embed dim 1024), tensor parallel across 4 tiles,
+# data parallel across the rest (12 tiles/node -> dp = 3 per node). 16 samples
+# per dp group, lr = 1e-3 * sqrt(global_batch_size / 64). tp must divide
+# num_heads (8), so use tp = 2, 4 or 8. Override the split with
+# --tensor_parallel / --context_parallel; global_batch_size must stay divisible
+# by dp = ranks / (tp * cp). No torch.compile, as on Perlmutter.
+# Not yet benchmarked on Aurora.
+
+mp_common: &mp_common
+  <<: *common
+  embed_dim: 1024
+  enable_jit: false
+  tp: 4
+  cp: 1
+  order: tp-cp-dp
+
+# Quick check, 1 node (tp=4, dp=3): 2 epochs of 10 steps on a subset
+mp_smoke:
+  <<: *mp_common
+  global_batch_size: 48
+  lr: 8.66e-4
+  num_iters: 20
+  limit_nsamples: 480
+  limit_nsamples_val: 96
+
+# Quick check, 2 nodes (tp=4, dp=6): 2 epochs of 10 steps on a subset
+mp_smoke_2node:
+  <<: *mp_common
+  global_batch_size: 96
+  lr: 1.22e-3
+  num_iters: 20
+  limit_nsamples: 960
+  limit_nsamples_val: 192
+
+mp_1node:                     # tp=4, dp=3; 790 steps/epoch
+  <<: *mp_common
+  global_batch_size: 48
+  lr: 8.66e-4
+  num_iters: 1580
+
+mp:                           # 4 nodes, tp=4, dp=12; 197 steps/epoch
+  <<: *mp_common
+  global_batch_size: 192
+  lr: 1.73e-3
+  num_iters: 788

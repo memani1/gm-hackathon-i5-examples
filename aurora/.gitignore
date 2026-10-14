@@ -1,0 +1,6 @@
+# Created by setup.sh and the jobs
+sc25-dl-tutorial/
+venv/
+logs/
+# PBS job output
+*.o[0-9]*

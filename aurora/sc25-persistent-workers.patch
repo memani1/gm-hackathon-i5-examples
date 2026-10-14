@@ -1,0 +1,21 @@
+Keep training DataLoader workers alive across epochs.
+
+Without persistent_workers, PyTorch re-forks every worker at the start of each
+epoch (~25 s per epoch on Aurora with 8 workers x 12 ranks/node), which
+dominates short epochs at scale. Measured on Aurora (full dataset, fp16, JIT):
+4 nodes 457 -> 652 samples/s, 16 nodes 758 -> 1230 samples/s.
+
+Applies to sc25-dl-tutorial commit 7e91316 (saforem2 sunspot-xpu-support):
+  (setup.sh applies it after checking out that commit)
+
+--- a/utils/data_loader.py
++++ b/utils/data_loader.py
+@@ -42,7 +42,7 @@
+         sampler=sampler,
+         worker_init_fn=worker_init,
+         drop_last=True,
+-        #                            persistent_workers=train,
++        persistent_workers=train and params.num_data_workers > 0,
+         pin_memory=torch.cuda.is_available(),
+     )
+ 

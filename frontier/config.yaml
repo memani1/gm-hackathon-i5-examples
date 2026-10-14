@@ -1,0 +1,48 @@
+# ViT-on-ERA5 training configs for Perlmutter.
+#
+# Only the settings train.py / train_mp.py actually read. Paths are inside the
+# container: submit.sh mounts $DATADIR at /data and $LOGDIR at /logs.
+# Both configs are sized for 4 nodes (16 GPUs) at 16 samples per data-parallel rank.
+#
+# Training runs whole epochs only (num_iters is rounded down to a multiple of
+# the epoch length), so num_iters is set to whole epochs of the 37960-sample
+# dataset: 4 for dp (~7 min job) and 2 for mp (~11 min job).
+
+common: &common
+  # Model
+  embed_dim: 384
+  depth: 12
+  num_heads: 8
+  patch_size: 8
+  dropout: 0.0
+  model_backend: pytorch
+
+  # Data
+  img_size: [360, 720]
+  dt: 1
+  n_in_channels: 20
+  n_out_channels: 20
+  train_data_path: /lustre/orion/stf218/world-shared/atsaris/DATA/sc25-dl-tutorial_data/train
+  valid_data_path: /lustre/orion/stf218/world-shared/atsaris/DATA/sc25-dl-tutorial_data/valid
+  global_means_path: /lustre/orion/stf218/world-shared/atsaris/DATA/sc25-dl-tutorial_data/stats/global_means.npy
+  global_stds_path: /lustre/orion/stf218/world-shared/atsaris/DATA/sc25-dl-tutorial_data/stats/global_stds.npy
+  limit_nsamples: null
+  limit_nsamples_val: null
+  data_loader_config: dali
+  num_data_workers: 8
+
+  # Training
+  expdir: ./logs
+  lr_schedule: cosine
+  warmup: 0
+  amp_mode: fp16
+  enable_fused: true
+
+# Optimized data parallel (upstream bs256_opt): run with train.py
+dp:
+  <<: *common
+  global_batch_size: 256
+  lr: 2e-3
+  enable_jit: false
+  num_iters: 3000
+

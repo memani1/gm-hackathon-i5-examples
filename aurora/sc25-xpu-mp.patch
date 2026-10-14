@@ -1,0 +1,504 @@
+Make train_mp.py (model parallel) run on Intel XPU under mpiexec.
+
+- train_mp.py: device helpers from utils/device.py instead of torch.cuda.*
+  (set_device, synchronize, autocast/GradScaler device, nvtx/profiler shims);
+  pynvml replaced by device.memory_used_gb(); transformer-engine imported only
+  when that backend is selected; ezpz.setup_torch() when WORLD_SIZE is unset
+  (mpiexec on Aurora); tp/cp/order read from the YAML, CLI flags override.
+- utils/comm.py: process-group backend from device.dist_backend() (xccl on
+  XPU) instead of hard-coded nccl; skip init if already initialized.
+- train_mp.py --grad_sync: on non-cuda devices (default 'auto') gradients are
+  synced once after backward instead of by DDP during it, so dp collectives
+  never overlap the tp/cp ones in backward (that overlap hangs oneCCL).
+- ReduceOp.AVG replaced by SUM + divide (train_mp.py, distributed/mappings.py)
+  since not every backend supports AVG.
+
+Applies to sc25-dl-tutorial commit 7e91316 (saforem2 sunspot-xpu-support):
+  (setup.sh applies it after checking out that commit)
+
+diff --git a/distributed/mappings.py b/distributed/mappings.py
+index 4cb9ae6..fea896e 100644
+--- a/distributed/mappings.py
++++ b/distributed/mappings.py
+@@ -229,8 +229,10 @@ def init_ddp_model_and_reduction_hooks(
+         # get future for allreduce
+ 
+         # do the normal DDP all reduce
++        # (pre-scale + SUM: ReduceOp.AVG isn't supported by every backend)
++        buff.div_(comm.get_size("dp"))
+         fut = dist.all_reduce(
+-            buff, op=dist.ReduceOp.AVG, group=comm.get_group("dp"), async_op=True
++            buff, op=dist.ReduceOp.SUM, group=comm.get_group("dp"), async_op=True
+         ).get_future()
+ 
+         # get grads for shared weights
+diff --git a/train_mp.py b/train_mp.py
+index 822825c..09e8839 100644
+--- a/train_mp.py
++++ b/train_mp.py
+@@ -3,7 +3,7 @@ import os
+ import time
+ import numpy as np
+ import argparse
+-import pynvml
++import contextlib
+ 
+ import torch
+ import torch.nn as nn
+@@ -12,7 +12,7 @@ from torch.amp import autocast, GradScaler
+ import torch.multiprocessing
+ from torch.utils.tensorboard import SummaryWriter
+ from torch.nn.parallel import DistributedDataParallel
+-from torch.distributed import ReduceOp
++from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+ 
+ import logging
+ from utils import logging_utils
+@@ -25,8 +25,8 @@ from utils import get_data_loader_distributed
+ from utils import comm
+ from utils.loss import l2_loss, l2_loss_opt
+ from utils.metrics import weighted_rmse
++from utils import device as _device
+ from networks import vit
+-from networks import vit_te
+ 
+ from distributed.mappings import init_ddp_model_and_reduction_hooks
+ from distributed.helpers import init_params_for_shared_weights
+@@ -34,15 +34,50 @@ from distributed.helpers import init_params_for_shared_weights
+ from utils.plots import generate_images
+ 
+ 
++def dp_mean_(tensor):
++    """In-place mean over the data-parallel group (SUM / size: ReduceOp.AVG
++    isn't supported by every backend, e.g. xccl)."""
++    torch.distributed.all_reduce(tensor, group=comm.get_group("dp"))
++    tensor.div_(comm.get_size("dp"))
++    return tensor
++
++
++def _allreduce_coalesced_(grads, group, divisor=1):
++    flat = _flatten_dense_tensors(grads)
++    torch.distributed.all_reduce(flat, group=comm.get_group(group))
++    if divisor > 1:
++        flat.div_(divisor)
++    for buf, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
++        buf.copy_(synced)
++
++
++def sync_grads_after_backward(model):
++    """Gradient sync done after backward instead of by DDP hooks during it,
++    so dp collectives never overlap the tp/cp ones issued inside backward
++    (that overlap can deadlock oneCCL on XPU). Same reductions as the DDP
++    path in distributed/mappings.py: mean over dp, plus a sum over the
++    groups in p.mark_for_reduction when cp > 1."""
++    params = [p for p in model.parameters() if p.grad is not None]
++    if not params:
++        return
++    if comm.get_size("dp") > 1:
++        _allreduce_coalesced_([p.grad for p in params], "dp", comm.get_size("dp"))
++    if comm.get_size("cp") > 1:
++        for group in comm.get_names():
++            if group == "dp":
++                continue
++            grads = [
++                p.grad for p in params if group in getattr(p, "mark_for_reduction", [])
++            ]
++            if grads:
++                _allreduce_coalesced_(grads, group)
++
++
+ def train(params, args, local_rank, world_rank, world_size):
+     # set device and benchmark mode
+-    torch.backends.cudnn.benchmark = True
+-    torch.cuda.set_device(local_rank)
+-    device = torch.device("cuda:%d" % local_rank)
+-
+-    # init pynvml and get handle
+-    pynvml.nvmlInit()
+-    nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(device.index)
++    if _device.DEVICE_TYPE == "cuda":
++        torch.backends.cudnn.benchmark = True
++    device = _device.set_device(local_rank)
+ 
+     # get data loader
+     logging.info("rank %d, begin data loader init" % world_rank)
+@@ -56,6 +91,13 @@ def train(params, args, local_rank, world_rank, world_size):
+ 
+     # create model
+     if params.model_backend == 'transformer-engine':
++        if _device.DEVICE_TYPE != "cuda":
++            raise RuntimeError(
++                "model_backend 'transformer-engine' needs NVIDIA GPUs; "
++                f"use 'pytorch' on {_device.DEVICE_TYPE}"
++            )
++        from networks import vit_te
++
+         logging.info("using transformer-engine backend")
+         model = vit_te.ViT(params).to(device)
+     else:  
+@@ -68,7 +110,7 @@ def train(params, args, local_rank, world_rank, world_size):
+         model = torch.compile(model)
+ 
+     if params.amp_dtype == torch.float16:
+-        scaler = GradScaler('cuda')
++        scaler = GradScaler(_device.DEVICE_TYPE)
+ 
+     # weight initialization needs to be synced across shared weights
+     if comm.get_size("tp-cp") > 1:
+@@ -79,6 +121,18 @@ def train(params, args, local_rank, world_rank, world_size):
+                                                    output_device=[local_rank],
+                                                    bucket_cap_mb=args.bucket_cap_mb)
+ 
++    # DDP still does the initial weight broadcast; only the in-backward
++    # gradient all-reduce is replaced
++    defer_grad_sync = isinstance(model, DistributedDataParallel) and (
++        args.grad_sync == "after_backward"
++        or (args.grad_sync == "auto" and _device.DEVICE_TYPE != "cuda")
++    )
++    if world_rank == 0:
++        logging.info(
++            "gradient sync: %s",
++            "after backward" if defer_grad_sync else "DDP (overlapped with backward)",
++        )
++
+     if params.enable_fused:
+         optimizer = optim.Adam(
+             model.parameters(), lr=params.lr, fused=True, betas=(0.9, 0.95)
+@@ -88,10 +142,9 @@ def train(params, args, local_rank, world_rank, world_size):
+ 
+     if world_rank == 0:
+         logging.info(model)
+-        all_mem_gb = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle).used / (
+-            1024.0 * 1024.0 * 1024.0
++        logging.info(
++            f"Scaffolding memory high watermark: {_device.memory_used_gb()} GB."
+         )
+-        logging.info(f"Scaffolding memory high watermark: {all_mem_gb} GB.")
+ 
+     iters = 0
+     startEpoch = 0
+@@ -122,24 +175,18 @@ def train(params, args, local_rank, world_rank, world_size):
+     # Log initial loss on train and validation to tensorboard
+     with torch.no_grad():
+         inp, tar = map(lambda x: x.to(device), next(iter(train_data_loader)))
+-        with autocast('cuda', enabled=params.amp_enabled, dtype=params.amp_dtype):
++        with autocast(_device.DEVICE_TYPE, enabled=params.amp_enabled, dtype=params.amp_dtype):
+             gen = model(inp)
+         tr_loss = loss_func(gen, tar)
+         inp, tar = map(lambda x: x.to(device), next(iter(val_data_loader)))
+-        with autocast('cuda', enabled=params.amp_enabled, dtype=params.amp_dtype):
++        with autocast(_device.DEVICE_TYPE, enabled=params.amp_enabled, dtype=params.amp_dtype):
+             gen = model(inp)
+         val_loss = loss_func(gen, tar)
+         val_rmse = weighted_rmse(gen, tar)
+         if params.distributed:
+-            torch.distributed.all_reduce(
+-                tr_loss, op=ReduceOp.AVG, group=comm.get_group("dp")
+-            )
+-            torch.distributed.all_reduce(
+-                val_loss, op=ReduceOp.AVG, group=comm.get_group("dp")
+-            )
+-            torch.distributed.all_reduce(
+-                val_rmse, op=ReduceOp.AVG, group=comm.get_group("dp")
+-            )
++            dp_mean_(tr_loss)
++            dp_mean_(val_loss)
++            dp_mean_(val_rmse)
+         if world_rank == 0:
+             args.tboard_writer.add_scalar("Loss/train", tr_loss.item(), 0)
+             args.tboard_writer.add_scalar("Loss/valid", val_loss.item(), 0)
+@@ -151,7 +198,7 @@ def train(params, args, local_rank, world_rank, world_size):
+     iters = 0
+     t1 = time.time()
+     for epoch in range(startEpoch, startEpoch + params.num_epochs):
+-        torch.cuda.synchronize()  # device sync to ensure accurate epoch timings
++        _device.synchronize()  # device sync to ensure accurate epoch timings
+         if params.distributed and (train_sampler is not None):
+             train_sampler.set_epoch(epoch)
+         start = time.time()
+@@ -166,54 +213,58 @@ def train(params, args, local_rank, world_rank, world_size):
+         for i, data in enumerate(train_data_loader, 0):
+             if world_rank == 0:
+                 if epoch == 3 and i == 0:
+-                    torch.cuda.profiler.start()
++                    _device.profiler.start()
+                 if epoch == 3 and i == len(train_data_loader) - 1:
+-                    torch.cuda.profiler.stop()
++                    _device.profiler.stop()
+ 
+-            torch.cuda.nvtx.range_push(f"step {i}")
++            _device.nvtx.range_push(f"step {i}")
+             iters += 1
+             dat_start = time.time()
+-            torch.cuda.nvtx.range_push(f"data copy in {i}")
++            _device.nvtx.range_push(f"data copy in {i}")
+ 
+             inp, tar = map(lambda x: x.to(device), data)
+-            torch.cuda.nvtx.range_pop()  # copy in
++            _device.nvtx.range_pop()  # copy in
+ 
+             tr_start = time.time()
+             b_size = inp.size(0)
+ 
+             optimizer.zero_grad()
+ 
+-            torch.cuda.nvtx.range_push(f"forward")
+-            with autocast('cuda', enabled=params.amp_enabled, dtype=params.amp_dtype):
+-                gen = model(inp)
+-                loss = loss_func(gen, tar)
+-            torch.cuda.nvtx.range_pop()  # forward
++            # no_sync must cover forward and backward
++            with (model.no_sync() if defer_grad_sync else contextlib.nullcontext()):
++                _device.nvtx.range_push(f"forward")
++                with autocast(_device.DEVICE_TYPE, enabled=params.amp_enabled, dtype=params.amp_dtype):
++                    gen = model(inp)
++                    loss = loss_func(gen, tar)
++                _device.nvtx.range_pop()  # forward
++
++                if world_rank == 0 and i == 1:  # print the mem used
++                    logging.info(
++                        f" Memory usage after forward pass: {_device.memory_used_gb()} GB."
++                    )
+ 
+-            if world_rank == 0 and i == 1:  # print the mem used
+-                all_mem_gb = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle).used / (
+-                    1024.0 * 1024.0 * 1024.0
+-                )
+-                logging.info(f" Memory usage after forward pass: {all_mem_gb} GB.")
++                if params.amp_dtype == torch.float16:
++                    scaler.scale(loss).backward()
++                else:
++                    loss.backward()
++            if defer_grad_sync:
++                sync_grads_after_backward(model)
+ 
+             if params.amp_dtype == torch.float16:
+-                scaler.scale(loss).backward()
+-                torch.cuda.nvtx.range_push(f"optimizer")
++                _device.nvtx.range_push(f"optimizer")
+                 scaler.step(optimizer)
+-                torch.cuda.nvtx.range_pop()  # optimizer
++                _device.nvtx.range_pop()  # optimizer
+                 scaler.update()
+             else:
+-                loss.backward()
+-                torch.cuda.nvtx.range_push(f"optimizer")
++                _device.nvtx.range_push(f"optimizer")
+                 optimizer.step()
+-                torch.cuda.nvtx.range_pop()  # optimizer
++                _device.nvtx.range_pop()  # optimizer
+ 
+             if params.distributed:
+-                torch.distributed.all_reduce(
+-                    loss, op=ReduceOp.AVG, group=comm.get_group("dp")
+-                )
++                dp_mean_(loss.detach())
+             tr_loss.append(loss.item())
+ 
+-            torch.cuda.nvtx.range_pop()  # step
++            _device.nvtx.range_pop()  # step
+             # lr step
+             scheduler.step()
+ 
+@@ -222,7 +273,7 @@ def train(params, args, local_rank, world_rank, world_size):
+             dat_time += tr_start - dat_start
+             step_count += 1
+ 
+-        torch.cuda.synchronize()  # device sync to ensure accurate epoch timings
++        _device.synchronize()  # device sync to ensure accurate epoch timings
+         end = time.time()
+ 
+         if world_rank == 0:
+@@ -255,7 +306,7 @@ def train(params, args, local_rank, world_rank, world_size):
+         with torch.inference_mode():
+             with torch.no_grad():
+                 for i, data in enumerate(val_data_loader, 0):
+-                    with autocast('cuda', enabled=params.amp_enabled, dtype=params.amp_dtype):
++                    with autocast(_device.DEVICE_TYPE, enabled=params.amp_enabled, dtype=params.amp_dtype):
+                         inp, tar = map(lambda x: x.to(device), data)
+                         gen = model(inp)
+                         val_loss += loss_func(gen, tar)
+@@ -263,12 +314,8 @@ def train(params, args, local_rank, world_rank, world_size):
+                     valid_steps += 1
+ 
+                 if params.distributed:
+-                    torch.distributed.all_reduce(
+-                        val_loss, op=ReduceOp.AVG, group=comm.get_group("dp")
+-                    )
+-                    torch.distributed.all_reduce(
+-                        val_rmse, op=ReduceOp.AVG, group=comm.get_group("dp")
+-                    )
++                    dp_mean_(val_loss)
++                    dp_mean_(val_rmse)
+ 
+         val_rmse /= valid_steps  # Avg validation rmse
+         val_loss /= valid_steps
+@@ -282,10 +329,9 @@ def train(params, args, local_rank, world_rank, world_size):
+             )
+             args.tboard_writer.flush()
+ 
+-    torch.cuda.synchronize()
++    _device.synchronize()
+     t2 = time.time()
+     tottime = t2 - t1
+-    pynvml.nvmlShutdown()
+ 
+ 
+ if __name__ == "__main__":
+@@ -351,25 +397,33 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--noddp", action="store_true", help="disable DDP communication"
+     )
++    parser.add_argument(
++        "--grad_sync",
++        default="auto",
++        choices=["auto", "overlap", "after_backward"],
++        help="'overlap': DDP all-reduce during backward; 'after_backward': one "
++        "sync after backward (avoids oneCCL deadlocks with tp/cp); "
++        "'auto': overlap on cuda, after_backward elsewhere",
++    )
+ 
+     # model parallelism arguments
+     parser.add_argument(
+         "--tensor_parallel",
+-        default=1,
++        default=None,
+         type=int,
+-        help="Number of GPUs for tensor parallelism",
++        help="Number of GPUs for tensor parallelism (overrides yaml 'tp', default 1)",
+     )
+     parser.add_argument(
+         "--context_parallel",
+-        default=1,
++        default=None,
+         type=int,
+-        help="Number of GPUs for context parallelism",
++        help="Number of GPUs for context parallelism (overrides yaml 'cp', default 1)",
+     )
+     parser.add_argument(
+         "--parallel_order",
+-        default="tp-cp-dp",
++        default=None,
+         type=str,
+-        help="Order of ranks for parallelism",
++        help="Order of ranks for parallelism (overrides yaml 'order', default tp-cp-dp)",
+     )
+ 
+     args = parser.parse_args()
+@@ -409,17 +463,41 @@ if __name__ == "__main__":
+ 
+     params.distributed = False
+ 
+-    # setup model parallel sizes
+-    params["tp"] = args.tensor_parallel
+-    params["cp"] = args.context_parallel
+-    params["order"] = args.parallel_order
+-    # initialize comm
++    # setup model parallel sizes (update() sets both the dict and the
++    # attribute that params.get() reads)
++    params.update(
++        {
++            "tp": args.tensor_parallel or params.get("tp", 1),
++            "cp": args.context_parallel or params.get("cp", 1),
++            "order": args.parallel_order or params.get("order", "tp-cp-dp"),
++        }
++    )
++
++    # Distributed setup. Under srun (Perlmutter SLURM) or torchrun the
++    # WORLD_SIZE/RANK/LOCAL_RANK/MASTER_* env vars are set and comm.init builds
++    # the process group itself. Under mpiexec (Aurora PALS) they're not, so
++    # let ezpz initialise it (rank discovery via MPI, xccl on XPU) first;
++    # comm.init then only builds the tp/cp/dp subgroups.
++    if os.environ.get("WORLD_SIZE", "").isdigit():
++        _device.distributed_env()  # validate env before creating the store
++        local_rank = None
++    else:
++        try:
++            import ezpz
++        except ImportError as e:
++            raise RuntimeError(
++                "WORLD_SIZE is not set and ezpz is not installed; launch with "
++                "torchrun/srun or `ezpz launch`"
++            ) from e
++        ezpz.setup_torch()
++        local_rank = ezpz.get_local_rank()
+     comm.init(params, verbose=True)
+ 
+     # get info from comm
+     world_size = comm.get_world_size()
+     world_rank = comm.get_world_rank()
+-    local_rank = comm.get_local_rank()
++    if local_rank is None:
++        local_rank = comm.get_local_rank()
+     params.distributed = world_size > 1
+ 
+     assert (
+diff --git a/utils/comm.py b/utils/comm.py
+index 7867707..0c356c8 100644
+--- a/utils/comm.py
++++ b/utils/comm.py
+@@ -2,6 +2,7 @@ import os
+ import logging
+ from utils.logging_utils import disable_logging
+ from utils.rank_generator import RankGenerator
++from utils import device as _device
+ import torch
+ import math
+ import numpy as np
+@@ -73,7 +74,7 @@ def get_local_rank():
+             # Use env var if available
+             return int(os.getenv("LOCAL_RANK"))
+         else:
+-            return get_world_rank() % torch.cuda.device_count()
++            return get_world_rank() % _device.device_count()
+ 
+ 
+ def init(params, verbose=False):
+@@ -103,8 +104,12 @@ def init(params, verbose=False):
+ 
+ def init_process_group():
+     """Initial torch distributed process group
+-    Uses NCCL
++    Backend follows the device (nccl / xccl / gloo). No-op if a launcher
++    helper (e.g. ezpz under mpiexec) already initialized it.
+     """
++    if dist.is_initialized():
++        return
++
+     world_size = int(os.getenv("WORLD_SIZE", 1))
+     world_rank = int(os.getenv("RANK", 0))
+     port = int(os.getenv("MASTER_PORT", 0))
+@@ -123,7 +128,7 @@ def init_process_group():
+ 
+         # initialize process groups
+         dist.init_process_group(
+-            backend="nccl", rank=world_rank, world_size=world_size, store=store
++            backend=_device.dist_backend(), rank=world_rank, world_size=world_size, store=store
+         )
+ 
+ 
+diff --git a/utils/device.py b/utils/device.py
+index c748a72..4a6252d 100644
+--- a/utils/device.py
++++ b/utils/device.py
+@@ -46,6 +46,20 @@ def synchronize() -> None:
+         torch.xpu.synchronize()
+ 
+ 
++def memory_used_gb() -> float:
++    """Device memory in use (GB), all processes; replaces pynvml on cuda."""
++    accel = {"cuda": torch.cuda, "xpu": getattr(torch, "xpu", None)}.get(DEVICE_TYPE)
++    if accel is None:
++        return 0.0
++    try:
++        free, total = accel.mem_get_info()
++        used = total - free
++    except (AttributeError, RuntimeError):
++        # older torch.xpu has no mem_get_info; fall back to this process only
++        used = accel.memory_reserved()
++    return used / 1024.0**3
++
++
+ def dist_backend() -> str:
+     default = {"cuda": "nccl", "xpu": "xccl"}.get(DEVICE_TYPE, "gloo")
+     backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", default)
