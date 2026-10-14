@@ -38,17 +38,10 @@ for you. On Aurora, `setup.sh` also applies two patches on top of it: one keeps
 DataLoader workers alive between epochs, and one ports the model-parallel
 `train_mp.py` to Intel GPUs.
 
-## Sources and credits
+## Credits
 
-The folders are copied from the `vit-training/` folders of the per-system AmSC example repositories.
-The only edits are two path references in `aurora/` (a comment in `ViT_aurora.yaml` and an
-error message in `submit_aurora.sh`), updated for this repo's layout.
-
-| Folder | Source | Commit | Authors |
-|---|---|---|---|
-| `perlmutter` | `amsc2/users/ai/perlmutter` (`main`) | `1e24b3b` | Steve Farrell |
-| `aurora` | `amsc2/users/ai/aurora` (`vit-training-xpu-mp`) | `b04e123` | Kyle Felker, Murali Emani |
-| `frontier` | `amsc2/users/ai/frontier` (`main`) | `3330b41` | Aristeidis Tsaris |
-
-The training code is from the SC25 tutorial by NERSC, with device portability by
-Sam Foreman.
+- Perlmutter example: Steve Farrell
+- Aurora example: Kyle Felker, Murali Emani
+- Frontier example: Aristeidis Tsaris
+- Training code: the [SC25 deep learning at scale tutorial](https://github.com/NERSC/sc25-dl-tutorial)
+  by NERSC, with device portability by Sam Foreman
