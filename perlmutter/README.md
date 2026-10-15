@@ -15,8 +15,8 @@ in data-parallel (`dp`) or model-parallel (`mp`) mode.
 
 ```bash
 ./setup.sh
-sbatch -A <account> submit.sh dp
-sbatch -A <account> submit.sh mp
+sbatch -A m5429_g --reservation=gm_hackathon26_session5 submit.sh dp
+sbatch -A m5429_g --reservation=gm_hackathon26_session5 submit.sh mp
 ```
 
 Submit from this directory. Output goes to `vit-era5-<jobid>.out` here, and
@@ -49,13 +49,13 @@ Extra arguments after the config name are passed to the training script:
 
 ```bash
 # Quick check: one epoch
-sbatch -q debug submit.sh dp --num_iters=148
+sbatch -q debug <other-args> submit.sh dp --num_iters=148
 
 # Tensor parallelism instead of context parallelism
-sbatch submit.sh mp --tensor_parallel=4 --context_parallel=1
+sbatch <other-args> submit.sh mp --tensor_parallel=4 --context_parallel=1
 
 # Fewer nodes with the same per-GPU batch size
-sbatch -N 1 submit.sh dp --local_batch_size=16
+sbatch -N 1 <other-args> submit.sh dp --local_batch_size=16
 ```
 
 `--local_batch_size` keeps 16 samples per GPU at any node count, but the learning
