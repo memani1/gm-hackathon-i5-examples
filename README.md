@@ -18,16 +18,16 @@ Start with the README for the system you're using.
 
 ## Hackathon reservations
 
-**Perlmutter:** use account `m5429_g` and reservation `gm_hackathon26_session5`
-(2026-10-15, 13:30–15:00 Pacific). From `perlmutter`:
+Use the following hackathon allocations. The Quick start in each system's README
+shows where they go.
 
-```bash
-./setup.sh
-sbatch -A m5429_g --reservation=gm_hackathon26_session5 submit.sh dp
-sbatch -A m5429_g --reservation=gm_hackathon26_session5 submit.sh mp
-```
+| System | Account / project | Reservation / queue | Available |
+|---|---|---|---|
+| Perlmutter | `m5429_g` | `gm_hackathon26_session5` (250 nodes) | During the session: 2026-10-15, 13:30–15:00 Pacific |
+| Aurora | `GenesisHackathonOct26` | `R8914313` | All hackathon week |
 
-**Aurora:** see the Quick start in [`aurora/README.md`](aurora/README.md).
+After the session, Perlmutter also has a 100-node reservation on the same account:
+`gm_hackathon26_day3` (2026-10-16, 07:00–13:30 Pacific).
 
 ## Training code
 
